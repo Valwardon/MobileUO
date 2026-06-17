@@ -5,6 +5,13 @@ using System.IO;
 using UnityEngine;
 using UnityEngine.Networking;
 
+/// <summary>
+/// Downloads all shard files from a directory listing.
+/// 
+/// On Android this class starts an Android foreground service via
+/// <see cref="AndroidDownloadServiceBridge"/> so that downloads continue
+/// uninterrupted when the user switches to another app or turns off the screen.
+/// </summary>
 public class DirectoryDownloader : DownloaderBase
 {
     private List<string> filesToDownload;
@@ -31,6 +38,13 @@ public class DirectoryDownloader : DownloaderBase
         resourcePathForFilesToDownload = downloadState.ResourcePathForFilesToDownload ?? "";
         numberOfFilesToDownload = filesToDownload.Count;
         downloadPresenter.SetFileList(filesToDownload);
+
+        // Start the Android foreground service so the download survives
+        // the user switching screens or the OS trying to reclaim resources.
+        AndroidDownloadServiceBridge.StartService(
+            numberOfFilesToDownload,
+            !string.IsNullOrEmpty(serverConfiguration.Name) ? serverConfiguration.Name : serverConfiguration.FileDownloadServerUrl);
+
         downloadCoroutine = downloadPresenter.StartCoroutine(DownloadFiles());
     }
     
@@ -67,6 +81,9 @@ public class DirectoryDownloader : DownloaderBase
             UpdateDownloadProgress();
             yield return null;
         }
+
+        // All files downloaded – stop the foreground service before transitioning.
+        AndroidDownloadServiceBridge.StopService();
 
         serverConfiguration.AllFilesDownloaded = true;
         ServerConfigurationModel.SaveServerConfigurations();
@@ -110,6 +127,14 @@ public class DirectoryDownloader : DownloaderBase
             ++numberOfFilesDownloaded;
             downloadPresenter.SetFileDownloaded(fileName);
             downloadPresenter.UpdateView(numberOfFilesDownloaded, numberOfFilesToDownload);
+
+            // Update the persistent notification with the latest progress so
+            // the user can see how the download is progressing from the
+            // notification shade without opening the app.
+            AndroidDownloadServiceBridge.UpdateProgress(
+                numberOfFilesDownloaded,
+                numberOfFilesToDownload,
+                fileName);
         }
         else
         {
@@ -118,6 +143,8 @@ public class DirectoryDownloader : DownloaderBase
                 var error = $"Error while downloading {fileName}: {request.error}";
                 downloadPresenter.StopCoroutine(downloadCoroutine);
                 downloadCoroutine = null;
+                // Fatal error – stop the foreground service.
+                AndroidDownloadServiceBridge.StopService();
                 downloadState.StopAndShowError(error);
             }
             else
@@ -139,6 +166,11 @@ public class DirectoryDownloader : DownloaderBase
             downloadPresenter.StopCoroutine(downloadCoroutine);
             downloadCoroutine = null;
         }
+
+        // Ensure the foreground service is always stopped when the downloader
+        // is disposed (e.g. user presses Cancel).
+        AndroidDownloadServiceBridge.StopService();
+
         filesToDownload = null;
         downloadAttemptsPerFile?.Clear();
         downloadAttemptsPerFile = null;

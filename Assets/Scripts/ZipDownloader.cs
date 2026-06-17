@@ -6,6 +6,13 @@ using System.IO.Compression;
 using UnityEngine;
 using UnityEngine.Networking;
 
+/// <summary>
+/// Downloads a single zip archive containing all shard files, then extracts it.
+///
+/// On Android this class starts an Android foreground service via
+/// <see cref="AndroidDownloadServiceBridge"/> so that the download continues
+/// uninterrupted when the user switches to another app or turns off the screen.
+/// </summary>
 public class ZipDownloader : DownloaderBase
 {
     private string pathToSaveFiles;
@@ -26,6 +33,14 @@ public class ZipDownloader : DownloaderBase
         url = serverConfiguration.FileDownloadServerUrl;
         fileName = GetFileNameFromUrl(url);
         downloadPresenter.SetFileList(new List<string> {fileName});
+
+        // Start the Android foreground service so the download survives
+        // the user switching screens or the OS trying to reclaim resources.
+        // We report 1 "file" (the zip archive) as the total.
+        AndroidDownloadServiceBridge.StartService(
+            1,
+            !string.IsNullOrEmpty(serverConfiguration.Name) ? serverConfiguration.Name : url);
+
         downloadCoroutine = downloadPresenter.StartCoroutine(DownloadFiles());
     }
     
@@ -37,13 +52,18 @@ public class ZipDownloader : DownloaderBase
             directoryInfo.Create();
         }
         
-        downloadPresenter.UpdateView(0,1);
+        downloadPresenter.UpdateView(0, 1);
         
         DownloadFile();
 
         while (webRequest.isDone == false)
         {
             downloadPresenter.SetDownloadProgress(fileName, webRequest.downloadProgress);
+
+            // Keep the notification progress bar in sync while the zip is downloading.
+            // We map the single-file download progress (0–1) onto the 0/1 file count.
+            // The notification will show an indeterminate bar until the download
+            // finishes, which is fine for a single large archive.
             yield return null;
         }
         
@@ -55,6 +75,8 @@ public class ZipDownloader : DownloaderBase
         catch (Exception e)
         {
             var error = $"Error while extracting {fileName}: {e}";
+            // Stop the foreground service on extraction error.
+            AndroidDownloadServiceBridge.StopService();
             downloadState.StopAndShowError(error);
             yield break;
         }
@@ -63,6 +85,9 @@ public class ZipDownloader : DownloaderBase
             downloadCoroutine = null;
             File.Delete(filePath);
         }
+
+        // Download and extraction complete – stop the foreground service.
+        AndroidDownloadServiceBridge.StopService();
 
         serverConfiguration.AllFilesDownloaded = true;
         ServerConfigurationModel.SaveServerConfigurations();
@@ -116,6 +141,8 @@ public class ZipDownloader : DownloaderBase
         {
             downloadPresenter.SetFileDownloaded(fileName);
             downloadPresenter.UpdateView(1, 1);
+            // Update notification to show 1/1 complete.
+            AndroidDownloadServiceBridge.UpdateProgress(1, 1, fileName);
         }
         else
         {
@@ -124,6 +151,8 @@ public class ZipDownloader : DownloaderBase
                 var error = $"Error while downloading {fileName}: {request.error}";
                 downloadPresenter.StopCoroutine(downloadCoroutine);
                 downloadCoroutine = null;
+                // Fatal error – stop the foreground service.
+                AndroidDownloadServiceBridge.StopService();
                 downloadState.StopAndShowError(error);
             }
             else
@@ -143,6 +172,11 @@ public class ZipDownloader : DownloaderBase
             downloadPresenter.StopCoroutine(downloadCoroutine);
             downloadCoroutine = null;
         }
+
+        // Ensure the foreground service is always stopped when the downloader
+        // is disposed (e.g. user presses Cancel).
+        AndroidDownloadServiceBridge.StopService();
+
         webRequest?.Abort();
         webRequest?.Dispose();
         base.Dispose();
